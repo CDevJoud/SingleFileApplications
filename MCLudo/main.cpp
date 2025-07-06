@@ -1,0 +1,823 @@
+#undef UNICODE
+#include <WS2tcpip.h>
+#include <WinSock2.h>
+#include <Windows.h>
+#include <unordered_map>
+#include <string>
+#include <sstream>
+#include <fstream>
+#include <thread>
+#include <functional>
+#include <mutex>
+#pragma comment(lib, "Ws2_32.lib")
+#pragma warning(disable:4996)
+struct WinSockInit {
+	WinSockInit() {
+		WSADATA data;
+		WSAStartup(MAKEWORD(2, 2), &data);
+	}
+	~WinSockInit() {
+		WSACleanup();
+	}
+};
+WinSockInit winsockinit;
+
+typedef signed char Int8;
+typedef signed short Int16;
+typedef signed long Int32;
+typedef signed long long Int64;
+
+typedef unsigned char Uint8;
+typedef unsigned short Uint16;
+typedef unsigned long Uint32;
+typedef unsigned long long Uint64;
+
+typedef Uint8 Byte;
+typedef Uint16 Word;
+typedef Uint32 Dword;
+typedef Uint64 Qword;
+
+#define MCLUDO_STARTUP(_App) INT WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPTSTR, _In_ INT){_App app; return app.run();}
+
+class VarInt32 {
+public:
+	VarInt32() {
+		memset(&VarInt32::data.bytes, 0, 5);
+	}
+	VarInt32(const VarInt32& vInt) {
+		VarInt32::data = vInt.data;
+	}
+	VarInt32(const Int32& num) {
+		VarInt32::data = VarInt32::Write(num).data;
+	}
+	VarInt32(const Byte* bytes) {
+		if (bytes != nullptr) {
+			memcpy(VarInt32::data.bytes, bytes, 5);
+		}
+	}
+	static VarInt32 Write(Int32 number) {
+		VarInt32 vi{};
+		int count = 0;
+		unsigned int i = number;
+		do {
+			unsigned char tmp = (i & 0b01111111);
+			i >>= 7;
+			if (i != 0) tmp |= 0b10000000;
+			vi.data.bytes[count] = tmp;
+			count++;
+		} while (i != 0);
+		return vi;
+	}
+	static Int32 Read(const VarInt32& vInt, Int32& index) {
+		int result = 0;
+		unsigned char b;
+		do {
+			if (index >= 5) break;
+
+			b = vInt.data.bytes[index];
+			int value = (b & 0b01111111);
+			result |= (value << (7 * index));
+			index++;
+		} while ((b & 0b10000000) != 0);
+		return result;
+	}
+	union {
+		struct { Byte b1, b2, b3, b4, b5; };
+		Byte bytes[5];
+	}data;
+};
+
+static Int32 operator>>(Int32& o, const VarInt32& i) {
+	Int32 index = 0;
+	o = VarInt32::Read(i, index);
+	return index;
+}
+
+static Int32 operator>>(Byte& o, const VarInt32& i) {
+	Int32 index = 0;
+	o = VarInt32::Read(i, index);
+	return index;
+}
+
+static Int32 operator>>(double& o, const VarInt32& i) {
+	Int32 index = 0;
+	o = VarInt32::Read(i, index);
+	return index;
+}
+
+static void operator<<(VarInt32& o, const Int32& i) {
+	o = VarInt32::Write(i);
+}
+
+class Socket {
+public:
+	static constexpr inline Qword Invalid = (Qword)(~0);
+	enum Status {
+		Done = 0,
+		NotReady,
+		Partial,
+		Disconnected,
+		Error
+	};
+	Socket() : 
+	m_qwSocket(Socket::Invalid),
+	m_bIsBlocking(true) {
+
+	}
+	virtual ~Socket() {
+		
+	}
+
+	void SetBlocking(bool value) {
+		if (Socket::GetNativeHandle() != Socket::Invalid) {
+			Dword blocking = value ? 0 : 1;
+			ioctlsocket(Socket::GetNativeHandle(), static_cast<Int32>(FIONBIO), &blocking);
+			Socket::m_bIsBlocking = value;
+		}
+	}
+	bool IsBlocking() const {
+		return Socket::m_bIsBlocking;
+	}
+
+protected:
+	void Close() {
+		if (Socket::GetNativeHandle() != Socket::Invalid) {
+			closesocket(Socket::GetNativeHandle());
+			Socket::m_qwSocket = Socket::Invalid;
+		}
+	}
+
+	Qword GetNativeHandle() const {
+		return Socket::m_qwSocket;
+	}
+	void Create() {
+		if (Socket::GetNativeHandle() == Socket::Invalid) {
+			const Qword handle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			if (handle == Socket::Invalid) {
+				throw std::runtime_error("Failed To Create Socket");  return;
+			}
+			Socket::Create(handle);
+		}
+	}
+
+	void Create(Qword handle) {
+		if (Socket::GetNativeHandle() == Socket::Invalid) {
+			Socket::m_qwSocket = handle;
+			Socket::SetBlocking(Socket::IsBlocking());
+
+			Dword yes = 1;
+			if (setsockopt(Socket::GetNativeHandle(), IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&yes), sizeof yes) == -1) {
+				throw std::runtime_error("Failed to set socket option");
+			}
+		}
+	}
+	
+private:
+	Qword m_qwSocket;
+	bool m_bIsBlocking : 1;
+};
+
+class TCPServer;
+class TCPClient;
+
+class Packet {
+public:
+	Packet(const Int32& pID) {
+		this->m_nPID = pID;
+	}
+	Packet() {
+
+	}
+	Packet(const std::vector<Byte>& data) {
+		Packet::m_bytes = data;
+		
+	}
+	~Packet() {
+		Packet::m_bytes.clear();
+		Packet::m_bytes.shrink_to_fit();
+	}
+
+	std::vector<Byte>& GetRawBytes() {
+		return Packet::m_bytes;
+	}
+	Int32& GetReadIndex() {
+		return m_nRIndex;
+	}
+	void SetReadIndex(Int32 index) {
+		Packet::m_nRIndex = index;
+	}
+	void SetID(Int8 id) {
+		Packet::m_nPID = id;
+	}
+	Int32 GetID() const {
+		return Packet::m_nPID;
+	}
+private:
+	friend class TCPClient;
+	void UpdateID() {
+		if (!this->GetRawBytes().empty()) {
+			Int32 bytesRead = m_nPID >> VarInt32(this->GetRawBytes().data() + this->GetReadIndex());
+			this->SetReadIndex(this->GetReadIndex() + bytesRead);
+		}
+	}
+	Int32 m_nRIndex = 0;
+	Int32 m_nPID = 0x00;
+	std::vector<Byte> m_bytes;
+};
+
+Packet& operator>>(Packet& p, std::string& str) {
+	Int32 length = 0;
+	if (!p.GetRawBytes().empty()) {
+		Int32 bytesRead = length >> VarInt32(p.GetRawBytes().data() + p.GetReadIndex());
+		p.SetReadIndex(p.GetReadIndex() + bytesRead);
+		str.reserve(length + 1);
+		str.insert(str.begin(), p.GetRawBytes().data() + p.GetReadIndex(), p.GetRawBytes().data() + p.GetReadIndex() + length);
+		p.SetReadIndex(p.GetReadIndex() + length);
+	}
+	return p;
+}
+
+Packet& operator>>(Packet& p, Int32& num) {
+	if (!p.GetRawBytes().empty()) {
+		Int32 bytesRead = num >> VarInt32(p.GetRawBytes().data() + p.GetReadIndex());
+		p.SetReadIndex(p.GetReadIndex() + bytesRead);
+	}
+	return p;
+}
+
+Packet& operator>>(Packet& p, Byte& num) {
+	if (!p.GetRawBytes().empty()) {
+		Int32 bytesRead = num >> VarInt32(p.GetRawBytes().data() + p.GetReadIndex());
+		p.SetReadIndex(p.GetReadIndex() + bytesRead);
+	}
+	return p;
+}
+
+static double SwapBytes(double value) {
+	uint64_t temp;
+	std::memcpy(&temp, &value, sizeof(double));       // Reinterpret as uint64_t
+	temp = std::byteswap(temp);                       // Swap the bytes
+	std::memcpy(&value, &temp, sizeof(double));       // Reinterpret back to double
+	return value;
+}
+
+Packet& operator>>(Packet& p, double& num) {
+	if (!p.GetRawBytes().empty()) {
+		double value = *reinterpret_cast<const double*>(p.GetRawBytes().data() + p.GetReadIndex());
+		num = SwapBytes(value);
+		p.SetReadIndex(p.GetReadIndex() + sizeof(double));
+	}
+	return p;
+}
+
+Packet& operator>>(Packet& p, Word& num) {
+	if (!p.GetRawBytes().empty()) {
+		short value = *reinterpret_cast<const short*>(p.GetRawBytes().data() + p.GetReadIndex());
+		short swapBytes = std::byteswap(value);
+		std::memcpy(&num, &swapBytes, sizeof(short));
+		p.SetReadIndex(p.GetReadIndex() + sizeof(short));
+	}
+	return p;
+}
+
+Packet& operator<<(Packet& p, const Word& num) {
+	p.GetRawBytes().insert(p.GetRawBytes().end(), reinterpret_cast<const char*>(&num), reinterpret_cast<const char*>(&num) + sizeof(short));
+	return p;
+}
+
+Packet& operator<<(Packet& p, const Byte& num) {
+	p.GetRawBytes().insert(p.GetRawBytes().end(), reinterpret_cast<const char*>(&num), reinterpret_cast<const char*>(&num) + sizeof(char));
+	return p;
+}
+
+Packet& operator<<(Packet& p, const double& num) {
+	p.GetRawBytes().insert(p.GetRawBytes().end(), reinterpret_cast<const char*>(&num), reinterpret_cast<const char*>(&num) + sizeof(double));
+	return p;
+}
+
+Packet& operator<<(Packet& p, const float& num) {
+	p.GetRawBytes().insert(p.GetRawBytes().end(), reinterpret_cast<const char*>(&num), reinterpret_cast<const char*>(&num) + sizeof(float));
+	return p;
+}
+
+Packet& operator<<(Packet& p, const Int32& num) {
+	p.GetRawBytes().insert(p.GetRawBytes().end(), reinterpret_cast<char*>(&const_cast<Int32&>(num)), reinterpret_cast<char*>(&const_cast<Int32&>(num)) + sizeof(int));
+	return p;
+}
+
+Packet& operator<<(Packet& p, Int32& num) {
+	p.GetRawBytes().insert(p.GetRawBytes().end(), reinterpret_cast<char*>(&num), reinterpret_cast<char*>(&num) + sizeof(Int32));
+	return p;
+}
+
+Packet& operator<<(Packet& p, VarInt32& vInt) {
+	Qword vIntLen = strlen((char*)vInt.data.bytes);
+	p.GetRawBytes().insert(p.GetRawBytes().end(), reinterpret_cast<char*>(&vInt), reinterpret_cast<char*>(&vInt) + vIntLen);
+	return p;
+}
+
+Packet& operator<<(Packet& p, const std::string& str) {
+	VarInt32 strlenvInt = str.size();
+	p << strlenvInt;
+	p.GetRawBytes().insert(p.GetRawBytes().end(), str.begin(), str.end());
+	return p;
+}
+
+class TCPClient : public Socket {
+public:
+	TCPClient(const TCPClient& client) {
+		this->Close();
+		this->Create(client.GetNativeHandle());
+	}
+	TCPClient() {
+
+	}
+	~TCPClient() {
+		//TCPClient::Disconnect();
+	}
+	Word GetLocalPort() const {
+		if (Socket::GetNativeHandle() != Socket::Invalid) {
+			sockaddr_in address{};
+			int size = sizeof address;
+			if (getsockname(Socket::GetNativeHandle(), (sockaddr*)&address, &size) != -1) {
+				return ntohs(address.sin_port);
+			}
+		}
+		return (Word)(~0);
+	}
+	const std::string GetRemoteAddress() const {
+		if (Socket::GetNativeHandle() != Socket::Invalid) {
+			SOCKADDR_IN address{};
+			int size = sizeof(address);
+
+			if (getpeername(Socket::GetNativeHandle(), reinterpret_cast<sockaddr*>(&address), &size) == 0) {
+				char ipBuffer[INET_ADDRSTRLEN];
+
+				if (inet_ntop(AF_INET, &address.sin_addr, ipBuffer, sizeof(ipBuffer))) {
+					return ipBuffer;
+				}
+			}
+		}
+	}
+	Word GetRemotePort() const {
+		if (Socket::GetNativeHandle() != Socket::Invalid) {
+			SOCKADDR_IN address{};
+			int size = sizeof(address);
+			if (getpeername(Socket::GetNativeHandle(), reinterpret_cast<sockaddr*>(&address), &size) != -1) {
+				return ntohs(address.sin_port);
+			}
+		}
+
+		return Word(~0);
+	}
+	void Disconnect() {
+		Socket::Close();
+	}
+	Status Send(const void* data, Qword size, Qword& sent) {
+		if (!data || (size == 0)) {
+			return Status::Error;
+		}
+
+		Int32 result = 0;
+		for (sent = 0; sent < size; sent += static_cast<Qword>(result)) {
+			result = static_cast<Int32>(send(Socket::GetNativeHandle(), static_cast<const char*>(data), static_cast<Int32>(size - sent), 0));
+		}
+
+		return Status::Done;
+	}
+	Status Send(Packet& p) {
+		Int32 ID = p.GetID();
+		p.GetRawBytes().insert(p.GetRawBytes().begin(), reinterpret_cast<char*>(&ID), reinterpret_cast<char*>(&ID) + sizeof Int8);
+		VarInt32 pSize = p.GetRawBytes().size();
+		int pSizeLen = strlen((char*)pSize.data.bytes);
+		p.GetRawBytes().insert(p.GetRawBytes().begin(), reinterpret_cast<char*>(&pSize), reinterpret_cast<char*>(&pSize) + pSizeLen);
+		Qword sent = 0;
+		return TCPClient::Send(p.GetRawBytes().data(), p.GetRawBytes().size(), sent);
+	}
+	Status Receive(void* data, Qword size, Qword& received) {
+		received = 0;
+		if (!data) {
+			return Status::Error;
+		}
+
+		const Int32 sizerecv = static_cast<Int32>(recv(Socket::GetNativeHandle(), static_cast<char*>(data), static_cast<Int32>(size), 0));
+
+		if (sizerecv > 0) {
+			return Status::Done;
+		}
+		if (sizerecv == 0) {
+			return Status::Disconnected;
+		}
+		return Status::Error;
+	}
+	Status Receive(Packet& p) {
+		VarInt32 packSize;
+		Qword r = 0;
+		Status res = TCPClient::Receive(&packSize, 5, r);
+
+		Int32 len = 0;
+		Int32 index = len >> packSize;
+		Int32 _len = len - sizeof VarInt32 + index;
+		if (_len >= 0) {
+			p.GetRawBytes().resize(_len);
+
+			TCPClient::Receive(p.GetRawBytes().data(), _len, r);
+
+			p.GetRawBytes().insert(p.GetRawBytes().begin(), reinterpret_cast<char*>(&packSize) + index, reinterpret_cast<char*>(&packSize) + sizeof(VarInt32));
+			p.UpdateID();
+			if (res != Error) {
+				return Done;
+			}
+		}
+		else {
+			return res;
+		}
+	}
+private:
+	friend class TCPServer;
+};
+
+class TCPServer : public Socket {
+public:
+	TCPServer() {
+
+	}
+
+	Status Listen(Word port, const std::string& ipAddress = "127.0.0.1") {
+		Socket::Close();
+
+		Socket::Create();
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(port);
+		addr.sin_addr.s_addr = inet_addr(ipAddress.c_str());
+		if (bind(Socket::GetNativeHandle(), (sockaddr*)&addr, sizeof addr) == -1) {
+			return Error;
+		}
+		if (listen(Socket::GetNativeHandle(), SOMAXCONN) == -1){
+			return Error;
+		}
+
+		return Done;
+	}
+	void Close() {
+		Socket::Close();
+	}
+	Status Accept(TCPClient& client) {
+		if (Socket::GetNativeHandle() == Socket::Invalid) {
+			return Error;
+		}
+		sockaddr_in addr{};
+		Int32 len = sizeof addr;
+		const Qword remote = accept(Socket::GetNativeHandle(), (sockaddr*)&addr, (int*)&len);
+		if (remote == Socket::Invalid) {
+			return Error;
+		}
+		client.Close();
+		client.Create(remote);
+
+		return Done;
+	}
+};
+
+class INIParser {
+public:
+	using Section = std::unordered_map<std::string, std::string>;
+	using Data = std::unordered_map<std::string, Section>;
+
+	bool Load(const std::string& filename) {
+		std::ifstream file(filename);
+		if (!file.is_open()) return false;
+
+		std::string line, currentSection;
+
+		while (std::getline(file, line)) {
+			Trim(line);
+			if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+
+			if (line.front() == '[' && line.back() == ']') {
+				currentSection = line.substr(1, line.size() - 2);
+				Trim(currentSection);
+			}
+			else {
+				size_t eq = line.find('=');
+				if (eq == std::string::npos) continue;
+
+				std::string key = line.substr(0, eq);
+				std::string value = line.substr(eq + 1);
+				Trim(key);
+				Trim(value);
+				data[currentSection][key] = value;
+			}
+		}
+
+		return true;
+	}
+
+	bool Save(const std::string& filename) const {
+		std::ofstream file(filename);
+		if (!file.is_open()) return false;
+
+		for (const auto& [section, entries] : data) {
+			file << "[" << section << "]\n";
+			for (const auto& [key, value] : entries) {
+				file << key << " = " << value << "\n";
+			}
+			file << "\n";
+		}
+
+		return true;
+	}
+
+	std::string Get(const std::string& section, const std::string& key, const std::string& defaultValue = "") const {
+		auto secIt = data.find(section);
+		if (secIt != data.end()) {
+			auto keyIt = secIt->second.find(key);
+			if (keyIt != secIt->second.end()) {
+				return keyIt->second;
+			}
+		}
+		return defaultValue;
+	}
+
+	void Set(const std::string& section, const std::string& key, const std::string& value) {
+		data[section][key] = value;
+	}
+
+private:
+	Data data;
+
+	static void Trim(std::string& s) {
+		size_t start = s.find_first_not_of(" \t\r\n");
+		size_t end = s.find_last_not_of(" \t\r\n");
+		s = (start == std::string::npos) ? "" : s.substr(start, end - start + 1);
+	}
+};
+
+class Startup {
+public:
+	virtual int run() = 0;
+};
+
+class Vector3D {
+public:
+	Vector3D() : x(x), y(y), z(z){}
+	Vector3D(double x, double y, double z) : x(x), y(y), z(z){}
+	double x, y, z;
+};
+
+class Player {
+public:
+	Player(TCPClient* client, const int entityID, const std::string& username, const std::string& uuid, const int pvn, bool& isServerRunning, bool isServerQuiting, const std::function<void(int)>& onDisconnection) :
+		m_client(client),
+		m_username(username), 
+		m_uuid(uuid),
+		m_pvn(pvn),
+		m_bIsServerRunning(isServerRunning),
+		m_bIsServerQuiting(isServerQuiting),
+		m_nEntityID(entityID),
+		m_fnOnDisconnection(onDisconnection) {
+
+	}
+	~Player() {
+		this->m_client->Disconnect();
+		delete this->m_client;
+	}
+	void HandleConnection() {
+		Packet JoinGame = 0x01;
+		JoinGame
+			<< Int32(0xBADC0DE)	// Entity ID
+			<< Byte(1) 			// Gamemode 
+			<< Byte(0) 			// Dimension
+			<< Byte(2) 			// Difficulty
+			<< Byte(0) 			// MaxPlayers
+			<< "default" 		// Level Type
+			<< (Byte)false;		// Reduced Debug Info
+
+		m_client->Send(JoinGame);
+
+		using Clock = std::chrono::steady_clock;
+		auto lastKeepAlive = Clock::now();
+
+		Packet look = 0x08;
+		look << 100.0 << m_position.y << m_position.z << 90.0f << 90.0f << Byte(0x00);
+
+		double dlook = 0.0;
+		std::memcpy(&dlook, look.GetRawBytes().data(), sizeof (double));
+		m_client->Send(look);
+		while (m_bIsServerRunning) {
+			// Check if 15 seconds passed
+			auto now = Clock::now();
+			if (std::chrono::duration_cast<std::chrono::seconds>(now - lastKeepAlive).count() >= 15) {
+				if (!SendKeepAlive(10))
+					/*break*/;
+				lastKeepAlive = now;
+			}
+
+			Packet req;
+			if (m_client->Receive(req) == Socket::Disconnected) {
+				break;
+			}
+
+			int PID = req.GetID();
+			switch (PID) {
+			case 0x15: StoreClientSettings(req); break;
+			case 0x04: UpdatePlayerPosition(req); break;
+			default: break;
+			}
+			
+		}
+
+		m_fnOnDisconnection(m_nEntityID);
+	}
+private:
+	void StoreClientSettings(Packet& req) {
+		req >> m_language >> m_nViewDistance >> m_nChatMode >> m_bChatColors >> m_nDisplayedSkinParts;
+	}
+	void UpdatePlayerPosition(Packet& req) {
+		req >> m_position.x >> m_position.y >> m_position.z >> m_bIsOnGround;
+
+		
+
+		Packet chunk = 0x21;
+
+		// === CHUNK COORDINATES ===
+		int32_t chunkX = 0;
+		int32_t chunkZ = 0;
+		bool groundUpContinuous = true;
+		uint16_t primaryBitMask = 0x0001;  // Only one section (y=0)
+
+		// === BLOCK DATA ===
+		std::vector<uint8_t> chunkData;
+
+		// --- Block IDs (4096 bytes) ---
+		// Fill entire section with Stone (block ID 1)
+		chunkData.insert(chunkData.end(), 4096, 0x01);
+
+		// --- Block Light (2048 bytes) ---
+		// 0xFF = maximum light for two 4-bit values per byte
+		chunkData.insert(chunkData.end(), 2048, 0xFF);
+
+		// --- Sky Light (2048 bytes) ---
+		// Only needed in Overworld (true for default dimension)
+		chunkData.insert(chunkData.end(), 2048, 0xFF);
+
+		// === CHUNK PACKET ===
+		VarInt32 chunkSize = chunkData.size();
+
+		chunk << Int32(chunkX)
+			<< Int32(chunkZ)
+			<< Byte(groundUpContinuous)
+			<< Word(primaryBitMask)
+			<< chunkSize;
+
+		// Append raw chunk section data
+		chunk.GetRawBytes().insert(
+			chunk.GetRawBytes().end(),
+			chunkData.begin(),
+			chunkData.end()
+		);
+
+		// === SEND TO CLIENT ===
+		m_client->Send(chunk);
+	}
+	void KeepConnectionAlive() {
+		
+	}
+	bool SendKeepAlive(Int32 id) {
+		Packet keepAlive = 0; // Packet ID 0x00 = Keep Alive
+		VarInt32 val = id;
+		keepAlive << val;
+		Qword sent = 0;
+		m_client->Send(keepAlive);
+
+		Packet keepAliveResp;
+		m_client->Receive(keepAliveResp);
+		Int32 respVal;
+		keepAliveResp >> respVal;
+		return (respVal == id);
+	}
+	//Client Settings
+	std::string m_language;
+	Byte m_nViewDistance, m_nChatMode, m_nDisplayedSkinParts;
+	Byte m_bChatColors;
+	//-Client Settings
+	
+	// Displacments
+	Vector3D m_position;
+	Byte m_bIsOnGround;
+	// Displacments
+
+	std::function<void(const int nEntityID)> m_fnOnDisconnection;
+	std::string m_username, m_uuid;
+	const int m_pvn, m_nEntityID;
+	bool m_bIsServerRunning, m_bIsServerQuiting;
+	TCPClient* m_client;
+
+	std::chrono::steady_clock::time_point m_lastSendTime;
+	Int32 m_nCounter;
+};
+
+class Application : public Startup {
+public:
+	
+	virtual int run() override {
+		TCPServer server;
+		if (server.Listen(25565, "192.168.50.44") == Socket::Error) {
+			throw std::runtime_error("Failed To Listen to 192.168.50.44:25565");
+			return -1;
+		}
+		m_fnOnDisconnection = [this](const int nEntityID) -> void {
+			std::lock_guard<std::mutex> lock(m_mutex);
+			auto it = m_players.find(nEntityID);
+			if (it != m_players.end()) {
+				m_players.erase(it);
+			}
+			};
+		m_bIsRunning = true;
+		while (m_bIsRunning) {
+			TCPClient client;
+			server.Accept(client);
+
+			Application::HandleIncomingConnection(client);
+		}
+		return 0;
+	}
+
+	void HandleIncomingConnection(TCPClient& client) {
+		Packet pack;
+		client.Receive(pack);
+
+		Int32 pvn;
+		std::string ip;
+		Word port;
+		Int32 NextState = 0;
+
+		if (pack.GetID() == 0x00) {
+			pack >> pvn >> ip >> port >> NextState;
+			if (NextState == 1) {
+				HandleStatus(client);
+			}
+			else if(NextState == 2){
+				HandleLogin(client, pvn);
+			}
+		}
+	}
+	inline void HandleLogin(TCPClient& client, const int& pvn) {
+		Packet loginStart;
+		client.Receive(loginStart);
+		std::string username;
+		loginStart >> username;
+
+		Packet loginSuccess = 0x02;
+		std::string uuid = "82be945a-36c1-4b38-975e-9366c24c6b50";
+		loginSuccess << uuid << username;
+
+		client.Send(loginSuccess);
+
+		m_players[m_nEntityID] = std::make_unique<Player>(new TCPClient(client), m_nEntityID, username, uuid, pvn, m_bIsRunning, m_bIsQuiting, m_fnOnDisconnection);
+		std::thread(&Player::HandleConnection, std::move(m_players[m_nEntityID])).detach();
+	}
+	inline void HandleStatus(TCPClient& client) {
+		const std::string status = R"DELIM({
+    "version": {
+        "name": "1.21.5",
+        "protocol": 47
+    },
+    "players": {
+        "max": 4,
+        "online": 0,
+        "sample": [
+            {
+                "name": "Hello From Cpp server:)",
+                "id": "4566e69f-c907-48ee-8d71-d7ba5aa00d20"
+            }
+        ]
+    },
+    "description": {
+        "text": "\u00a71                          L\u00a72U\u00a74D\u00a76O\u00a7r\n\u00a76    Minecraft Ludo Game Server Written in \u00a74\u00a7nC++"
+    },
+    "favicon": "data:image/png;base64,<data>",
+    "enforcesSecureChat": false
+})DELIM";
+		Packet statusPacket;
+		statusPacket << status;
+
+		client.Send(statusPacket);
+
+		Packet pingPacket;
+		client.Receive(pingPacket);
+
+		Sleep(1);
+		pingPacket.SetID(0x01);
+		client.Send(pingPacket);
+	}
+private:
+	std::function<void(const int)> m_fnOnDisconnection;
+	bool m_bIsRunning = false, m_bIsQuiting = false;
+	std::unordered_map<Int32, std::unique_ptr<Player>> m_players;
+	Int32 m_nEntityID;
+	std::mutex m_mutex;
+};
+
+MCLUDO_STARTUP(Application)
